@@ -122,3 +122,95 @@ class DataloaderTimer:
             "data_wait_total_time_ms": self.total_time_ms,
             "data_wait_max_ms_ever": self.max_time_ms,
         }
+
+
+class QueueDepthTimer:
+    """Wraps an async_loader to measure consumer-side starvation.
+
+    Semantics:
+      queue_get_total_ms: total time spent inside Queue.get() this step (includes lock noise)
+      queue_get_max_ms:   max single Queue.get() time this step (cleanest starvation signal)
+      producer_total_ms:  total time producer spent per __next__ this step (dataloader work)
+      producer_max_ms:    max single producer __next__ time this step
+      starved_steps:      cumulative count of steps where queue_get_max_ms > STARVED_THRESHOLD_MS
+
+    Drop-in replacement for DataloaderTimer in async-loader pipelines.
+
+    Producer timings are pulled from the (producer_dt, item) tuple the
+    async_loader puts on the queue, so they're exactly aligned with the
+    items the consumer consumed this step (no off-by-one when the producer
+    runs ahead of the consumer).
+    """
+
+    STARVED_THRESHOLD_MS = 1.0
+
+    def __init__(self, async_iter):
+        from nanochat.dataloader_async import async_loader as _async_loader
+        self.loader = async_iter
+        self._q = async_iter.queue
+        self._step_get_total_ms = 0.0
+        self._step_get_max_ms = 0.0
+        self._step_producer_times_ms = []
+        self._last_producer_total_ms = 0.0
+        self._last_producer_max_ms = 0.0
+        self._last_get_total_ms = 0.0
+        self._last_get_max_ms = 0.0
+        self.cum_starved_steps = 0
+        self.cum_get_total_ms = 0.0
+        self.cum_producer_total_ms = 0.0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        from nanochat.dataloader_async import _SENTINEL
+        t0 = time.perf_counter()
+        payload = self._q.get()
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self._step_get_total_ms += dt_ms
+        if dt_ms > self._step_get_max_ms:
+            self._step_get_max_ms = dt_ms
+        if payload is _SENTINEL:
+            if self.loader._exc:
+                raise self.loader._exc[0]
+            raise StopIteration
+        producer_dt_ms, item = payload
+        self._step_producer_times_ms.append(producer_dt_ms)
+        return item
+
+    def end_step(self):
+        # Snapshot current step's queue_get metrics BEFORE reset so summary() can read them.
+        self._last_get_total_ms = self._step_get_total_ms
+        self._last_get_max_ms = self._step_get_max_ms
+
+        # Producer timings were appended in lockstep with consumer __next__ calls,
+        # so this list corresponds exactly to the micro-batches consumed this step.
+        producer_times = self._step_producer_times_ms
+        if producer_times:
+            self._last_producer_total_ms = sum(producer_times)
+            self._last_producer_max_ms = max(producer_times)
+        else:
+            self._last_producer_total_ms = 0.0
+            self._last_producer_max_ms = 0.0
+
+        if self._last_get_max_ms > self.STARVED_THRESHOLD_MS:
+            self.cum_starved_steps += 1
+
+        self.cum_get_total_ms += self._last_get_total_ms
+        self.cum_producer_total_ms += self._last_producer_total_ms
+
+        self._step_get_total_ms = 0.0
+        self._step_get_max_ms = 0.0
+        self._step_producer_times_ms = []
+
+    def summary(self):
+        return {
+            "queue_get_total_ms": self._last_get_total_ms,
+            "queue_get_max_ms": self._last_get_max_ms,
+            "queue_get_cum_total_ms": self.cum_get_total_ms,
+            "producer_total_ms": self._last_producer_total_ms,
+            "producer_max_ms": self._last_producer_max_ms,
+            "producer_cum_total_ms": self.cum_producer_total_ms,
+            "queue_starved_steps": self.cum_starved_steps,
+            "queue_starved_threshold_ms": self.STARVED_THRESHOLD_MS,
+        }
