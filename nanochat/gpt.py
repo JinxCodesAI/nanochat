@@ -520,9 +520,11 @@ class GPT(nn.Module):
             return self._chunked_loss(x, targets, loss_reduction=loss_reduction)
 
         # Inference / sampling path: return softcapped logits in COMPUTE_DTYPE.
-        # The softcap is applied (as in the original code) to keep sampling behavior consistent
-        # with what the model was trained against. We do the softcap in fp32 then cast back to
-        # COMPUTE_DTYPE, so we never materialize a full (B, T, vocab) fp32 buffer in HBM.
+        # The softcap is applied in fp32 for numerical stability (matches training),
+        # then cast back to COMPUTE_DTYPE so callers see bf16 logits. Note that
+        # `logits.to(torch.float32)` does materialize a full (B, T, vocab) fp32 buffer
+        # in HBM (eager mode does not elide this cast). This is fine here because
+        # generate() only consumes the last token's logits; the fp32 buffer is transient.
         softcap = 15
         logits = self.lm_head(x)  # (B, T, padded_vocab_size)
         logits = logits[..., :self.config.vocab_size]
