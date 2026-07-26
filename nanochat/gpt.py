@@ -74,11 +74,16 @@ class BlockAttnRes(nn.Module):
     def forward(self, sources):
         """
         Args:
-            sources: list of (B, T, d) tensors to attend over.
+            sources: pre-stacked tensor of shape (K, B, T, d).
+                     (Also accepts list of tensors for backward compatibility.)
         Returns:
             (B, T, d) softmax-weighted aggregate of sources.
         """
-        stacked = torch.stack(sources, dim=0)                          # (K, B, T, d)
+        if isinstance(sources, list):
+            # Backward-compat path: torch.stack of Python list (breaks torch.compile)
+            stacked = torch.stack(sources, dim=0)  # (K, B, T, d)
+        else:
+            stacked = sources
         keys = stacked * torch.rsqrt(stacked.pow(2).mean(-1, keepdim=True) + self.eps)  # RMSNorm
         logits = (keys * self.w.view(1, 1, 1, -1)).sum(-1)             # (K, B, T)
         weights = logits.softmax(dim=0).to(dtype=stacked.dtype)         # softmax over sources, match dtype
@@ -664,36 +669,54 @@ class GPT(nn.Module):
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
         if self.config.use_block_attn_res:
-            # Block AttnRes: replace uniform residual accumulation with learned softmax
-            # attention over depth. Layers are partitioned into N blocks; completed blocks
-            # are saved as summaries. Each layer uses attn_res_pre_attn/attn_res_pre_mlp to
-            # compute a weighted aggregate of (block_summaries + embedding + partial_block)
-            # before feeding into the sub-layer.
+            # Block AttnRes (Kimi paper, §3.2): layers are partitioned into N blocks.
+            # Within each block, layer outputs accumulate via standard summation
+            # (intra_accum). Across blocks, learned softmax attention selects from
+            # completed block summaries + the current intra-block accumulator.
+            #
+            # Key design: intra_accum is the RAW sum of layer outputs (b_n^i in the
+            # paper), never rebased. Block summaries store that sum at boundaries.
+            # A pre-allocated tensor block_buf replaces Python list ops to avoid
+            # torch.compile graph breaks (list append/concat + torch.stack of
+            # variable-length lists forces eager-mode fallback).
             n_blocks = self.config.block_attn_res_n_blocks
             block_size = max(1, n_layer // n_blocks)
-            block_summaries = []   # one (B,T,d) tensor per completed block
-            partial_block = x  # running intra-block sum (no clone: tensors are never mutated in-place)
+            # Pre-allocated buffer: (max_blocks, B, T, d) — fixed shape, torch.compile-safe
+            max_blocks = (n_layer + block_size - 1) // block_size
+            block_buf = x.new_zeros(max_blocks, B, T, x.size(-1))
+            num_blocks = 0
+            # intra_accum: running sum of layer outputs within current block (b_n^i).
+            # Initially carries the embedding (b_0 = h_1 in the paper), which serves
+            # as the first source for layer 0's AttnRes.
+            intra_accum = x0
+            # Scratch buffer for stacking sources before AttnRes call.
+            # At most num_blocks completed summaries + 1 intra_accum tensor.
+            src_buf = x.new_zeros(max_blocks + 1, B, T, x.size(-1))
             for i, block in enumerate(self.transformer.h):
-                # Pre-attn: AttnRes over completed blocks + embedding + partial
-                sources = block_summaries + [x0, partial_block]
-                x_attn = self.attn_res_pre_attn[i](sources)
+                # --- Pre-attn: AttnRes over completed blocks + intra_accum ---
+                n_src = num_blocks + 1  # block summaries + intra_accum
+                if num_blocks > 0:
+                    src_buf[:num_blocks].copy_(block_buf[:num_blocks])
+                src_buf[num_blocks] = intra_accum
+                x_attn = self.attn_res_pre_attn[i](src_buf[:n_src])
                 ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
                 attn_out = block.attn_forward(x_attn, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-                partial_block = partial_block + attn_out
-                # Pre-MLP: AttnRes (with updated partial_block after attn)
-                sources = block_summaries + [x0, partial_block]
-                x_mlp = self.attn_res_pre_mlp[i](sources)
+                intra_accum = intra_accum + attn_out
+                # --- Pre-MLP: AttnRes (with updated intra_accum after attn) ---
+                src_buf[num_blocks] = intra_accum
+                x_mlp = self.attn_res_pre_mlp[i](src_buf[:n_src])
                 mlp_out = block.mlp_forward(x_mlp)
-                partial_block = partial_block + mlp_out
-                # Apply lambdas as post-hoc scaling on the layer output
-                x = self.resid_lambdas[i] * partial_block + self.x0_lambdas[i] * x0
-                partial_block = x
+                intra_accum = intra_accum + mlp_out
+                # --- Apply lambdas: scale the fully-accumulated intra-block sum ---
+                x = self.resid_lambdas[i] * intra_accum + self.x0_lambdas[i] * x0
                 # Backout cache (same as standard path)
                 if i == backout_layer:
                     x_backout = x
-                # Block boundary: save completed block summary, continue with current x
+                # --- Block boundary: save completed block summary, reset accumulator ---
                 if (i + 1) % block_size == 0 and i < n_layer - 1:
-                    block_summaries.append(x)  # no clone: x is reassigned next iter, tensor is immutable
+                    block_buf[num_blocks] = intra_accum  # save raw sum (paper's b_n)
+                    num_blocks += 1
+                    intra_accum = torch.zeros_like(x0)  # fresh accumulator for next block
         else:
             # Standard path: uniform residual accumulation (unchanged)
             for i, block in enumerate(self.transformer.h):
