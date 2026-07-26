@@ -126,65 +126,67 @@ def _flatten_doc_offsets(doc_offsets, B, T):
     doc_offsets[b, k] = end position of doc k-1 in row b (for k >= 1). Unused
     trailing slots are filled with row_capacity = T+1.
 
+    This is fully vectorized — no Python loops, no .item() syncs — so it runs
+    at GPU speed and can be fused with torch.compile if placed inside the model.
+
     Returns:
         cu_seqlens: 1D int32 tensor of fixed length (B*max_docs_per_row + 1).
     """
     assert doc_offsets.dim() == 2 and doc_offsets.size(0) == B, (
         f"doc_offsets must be (B, max_docs+1), got {tuple(doc_offsets.shape)}"
     )
-    max_docs_per_row = doc_offsets.size(1) - 1
-    max_cu_len = B * max_docs_per_row + 1  # fixed output length
+    D = doc_offsets.size(1) - 1  # max_docs_per_row
+    max_cu_len = B * D + 1       # fixed output length
+    device = doc_offsets.device
 
-    # `real` masks out the padding slots (those equal to row_capacity = T+1).
-    offs = doc_offsets.to(torch.int64)
-    real = offs < (T + 1)
-    # Number of real entries per row K_b (includes column 0 = the row-start marker).
-    row_real_count = real.sum(dim=1)  # (B,) int64
-    # Per-row token offset in the flat sequence.
-    row_tok_offset = torch.arange(B, dtype=torch.int64, device=offs.device) * T
-    parts = []
-    for b in range(B):
-        K = int(row_real_count[b].item())
-        row_ends = []
-        if K > 1:
-            for k in range(1, K):
-                row_ends.append(int(offs[b, k].item()) + int(row_tok_offset[b].item()))
-        if K > 1:
-            last_doc_end = int(offs[b, K - 1].item())
-        else:
-            last_doc_end = 0
-        if last_doc_end < T:
-            row_ends.append((b + 1) * T)
-        if row_ends:
-            parts.append(torch.tensor(row_ends, dtype=torch.int32, device=offs.device))
-    # Assemble: [0, ...all doc-ends..., B*T]
-    if parts:
-        body = torch.cat(parts)
+    # Row offset: flat global position = doc_offsets[b,k] + b*T
+    row_offset = torch.arange(B, dtype=torch.int32, device=device) * T  # (B,)
+    flat = doc_offsets.to(torch.int32) + row_offset.unsqueeze(1)        # (B, D+1)
+
+    # Select real doc ends: columns 1..D that are < T+1 (the start marker
+    # at column 0 is always 0 and handled implicitly by the row boundaries).
+    cols = torch.arange(D + 1, device=device)
+    is_doc_end = (doc_offsets < (T + 1)) & (cols >= 1).unsqueeze(0)  # (B, D+1)
+    doc_ends = flat[is_doc_end]  # flat global positions of all inter-document boundaries
+
+    # Row boundaries [T, 2T, ..., B*T]: these guarantee each row is represented
+    # as a contiguous segment even when its docs don't fully pack to T.
+    # Doc ends that land exactly on a row boundary (doc fills to exactly T)
+    # produce duplicates — sort + dedup below removes them.
+    row_ends = (torch.arange(1, B + 1, dtype=torch.int32, device=device)) * T  # (B,)
+
+    # All candidate boundary points in one flat tensor
+    all_ends = torch.cat([doc_ends, row_ends])  # (~B*D + B)
+    all_ends_sorted, _ = all_ends.sort()
+
+    # Remove consecutive duplicates (row boundaries overlapping with doc ends
+    # or with each other in degenerate cases).
+    if all_ends_sorted.numel() >= 2:
+        keep = torch.ones(all_ends_sorted.numel(), dtype=torch.bool, device=device)
+        keep[1:] = (all_ends_sorted[1:] != all_ends_sorted[:-1])
+        boundaries = all_ends_sorted[keep]
     else:
-        body = torch.empty(0, dtype=torch.int32, device=offs.device)
-    cu_raw = torch.cat([torch.zeros(1, dtype=torch.int32, device=offs.device), body,
-                         torch.tensor([B * T], dtype=torch.int32, device=offs.device)])
-    # Remove consecutive duplicates from row-cap / final B*T overlap.
-    if cu_raw.numel() >= 2:
-        keep = torch.ones(cu_raw.numel(), dtype=torch.bool, device=offs.device)
-        keep[1:] = (cu_raw[1:] != cu_raw[:-1])
-        cu = cu_raw[keep]
-    else:
-        cu = cu_raw
+        boundaries = all_ends_sorted
 
-    # Sanity checks
-    assert cu[0].item() == 0, f"cu_seqlens[0] must be 0, got {cu[0].item()}"
-    if cu.numel() > 1:
-        assert (cu[1:] >= 1).all(), f"All doc-ends must be >= 1, got first zeros at: {(cu[1:] == 0).nonzero(as_tuple=True)[0][:5].tolist()}"
-        diffs = cu[1:] - cu[:-1]
-        assert (diffs > 0).all(), f"cu_seqlens must be strictly increasing, got non-positive diffs at indices: {(diffs <= 0).nonzero(as_tuple=True)[0][:5].tolist()}"
-        assert cu[-1].item() == B * T, f"cu_seqlens must end at total tokens {B*T}, got {cu[-1].item()}"
-        assert (cu[-1] >= cu[-2]).item(), f"Last entry must be >= second-last, got {cu[-2].item()} >= {cu[-1].item()}"
+    # Assemble: [0, ...boundaries..., B*T]
+    B_T = torch.tensor([B * T], dtype=torch.int32, device=device)
+    cu = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=device),
+        boundaries,
+        B_T,
+    ])
 
-    # Pad to fixed length (trailing B*T = zero-length sequences to FA3).
+    # Final dedup (handles B*T overlapping with the last row_end entry)
+    if cu.numel() >= 2:
+        keep = torch.ones(cu.numel(), dtype=torch.bool, device=device)
+        keep[1:] = (cu[1:] != cu[:-1])
+        cu = cu[keep]
+
+    # Pad to fixed length: trailing B*T entries are zero-length segments to FA3
     if cu.numel() < max_cu_len:
-        pad = cu.new_full((max_cu_len - cu.numel(),), B * T)
+        pad = torch.full((max_cu_len - cu.numel(),), B * T, dtype=torch.int32, device=device)
         cu = torch.cat([cu, pad])
+
     return cu.contiguous()
 
 class CausalSelfAttention(nn.Module):
