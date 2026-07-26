@@ -672,7 +672,7 @@ class GPT(nn.Module):
             n_blocks = self.config.block_attn_res_n_blocks
             block_size = max(1, n_layer // n_blocks)
             block_summaries = []   # one (B,T,d) tensor per completed block
-            partial_block = x.clone()  # running intra-block sum
+            partial_block = x  # running intra-block sum (no clone: tensors are never mutated in-place)
             for i, block in enumerate(self.transformer.h):
                 # Pre-attn: AttnRes over completed blocks + embedding + partial
                 sources = block_summaries + [x0, partial_block]
@@ -693,7 +693,7 @@ class GPT(nn.Module):
                     x_backout = x
                 # Block boundary: save completed block summary, continue with current x
                 if (i + 1) % block_size == 0 and i < n_layer - 1:
-                    block_summaries.append(x.clone())
+                    block_summaries.append(x)  # no clone: x is reassigned next iter, tensor is immutable
         else:
             # Standard path: uniform residual accumulation (unchanged)
             for i, block in enumerate(self.transformer.h):
