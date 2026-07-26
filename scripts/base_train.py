@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, _flatten_doc_offsets
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -345,9 +345,11 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
 first = next(train_loader)
 if args.varlen_doc_attn:
     x, y, doc_offsets, dataloader_state_dict = first
+    cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, args.device_batch_size, args.max_seq_len)
 else:
     x, y, dataloader_state_dict = first
-    doc_offsets = None
+    cu_seqlens = None
+    max_seqlen = 0
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -525,7 +527,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, doc_offsets=doc_offsets)
+        loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -537,9 +539,11 @@ while True:
         nxt = next(train_loader)
         if args.varlen_doc_attn:
             x, y, doc_offsets, dataloader_state_dict = nxt
+            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, args.device_batch_size, args.max_seq_len)
         else:
             x, y, dataloader_state_dict = nxt
-            doc_offsets = None
+            cu_seqlens = None
+            max_seqlen = 0
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)

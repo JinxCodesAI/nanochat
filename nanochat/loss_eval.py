@@ -30,15 +30,18 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         nxt = next(batch_iter)
-        # dataloader yields 4-tuples (x, y, doc_offsets, state_dict) when varlen is on,
-        # 3-tuples (x, y, state_dict) when off — and the plain iterate wrapper strips
-        # state_dict, so we just check for 3 vs 2 elements here.
+        # dataloader yields 3-tuples (x, y, doc_offsets) when varlen is on,
+        # 2-tuples (x, y) when off.
         if isinstance(nxt, tuple) and len(nxt) == 3:
             x, y, doc_offsets = nxt
+            B, T = x.shape
+            from nanochat.gpt import _flatten_doc_offsets
+            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
         else:
             x, y = nxt
-            doc_offsets = None
-        loss2d = model(x, y, loss_reduction='none', doc_offsets=doc_offsets) # (B, T)
+            cu_seqlens = None
+            max_seqlen = 0
+        loss2d = model(x, y, loss_reduction='none', cu_seqlens=cu_seqlens, max_seqlen=max_seqlen) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

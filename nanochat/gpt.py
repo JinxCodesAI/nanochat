@@ -69,7 +69,6 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
-@torch.compiler.disable
 def _flatten_doc_offsets(doc_offsets, B, T):
     """
     Convert the per-row (B, max_docs+1) doc-boundary tensor into a single 1D
@@ -546,7 +545,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', doc_offsets=None):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', cu_seqlens=None, max_seqlen=0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -586,15 +585,6 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        # Honour the config flag: doc_offsets can be passed but we ignore it for
-        # the varlen path if the model was constructed with use_varlen_doc_attn=False.
-        # Pre-compute cu_seqlens once here (outside the trunk loop) so the
-        # conversion from (B, max_docs+1) to 1D int32 runs outside torch.compile.
-        if doc_offsets is not None and self.config.use_varlen_doc_attn:
-            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-        else:
-            cu_seqlens = None
-            max_seqlen = 0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None

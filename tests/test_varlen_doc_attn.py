@@ -154,11 +154,11 @@ def test_model_forward_with_doc_offsets_falls_back():
     x = torch.randint(0, 128, (B, T))
     y = torch.randint(0, 128, (B, T))
     loss_no_doc = model(x, y)
-    # Pass doc_offsets even though config flag is False — model should ignore them.
-    doc_offsets = torch.zeros((B, 4), dtype=torch.int32)
-    loss_with_doc = model(x, y, doc_offsets=doc_offsets)
+    # Pass doc_offsets — model now expects cu_seqlens, not doc_offsets.
+    # With the flag off, cu_seqlens=None is the same as no varlen.
+    loss_with_doc = model(x, y, cu_seqlens=None, max_seqlen=0)
     assert loss_no_doc.shape == ()
-    assert torch.allclose(loss_no_doc, loss_with_doc), "doc_offsets should be ignored when flag is off"
+    assert torch.allclose(loss_no_doc, loss_with_doc), "cu_seqlens=None should be ignored when flag is off"
     print("test_model_forward_with_doc_offsets_falls_back PASSED")
 
 
@@ -178,9 +178,9 @@ def test_model_forward_use_varlen_doc_attn_flag():
     B, T = 2, 64
     x = torch.randint(0, 128, (B, T))
     y = torch.randint(0, 128, (B, T))
-    # Pass doc_offsets=None (so fallback path runs) — this exercises the
+    # Pass cu_seqlens=None (so fallback path runs) — this exercises the
     # branch logic without needing FA3 varlen shape correctness.
-    loss = model(x, y, doc_offsets=None)
+    loss = model(x, y, cu_seqlens=None, max_seqlen=0)
     assert loss.shape == ()
     print("test_model_forward_use_varlen_doc_attn_flag PASSED")
 
