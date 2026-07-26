@@ -69,6 +69,7 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+@torch.compiler.disable
 def _flatten_doc_offsets(doc_offsets, B, T):
     """
     Convert the per-row (B, max_docs+1) doc-boundary tensor into a single 1D
