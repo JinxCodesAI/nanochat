@@ -46,10 +46,44 @@ class GPTConfig:
     # T=2048, vocab=32768, fp32). Chunking along T avoids materializing the full buffer.
     # Set to T (or larger) to fall back to the one-shot path.
     loss_chunk_size: int = 512
+    # Block Attention Residuals (AttnRes): replace uniform residual accumulation with
+    # learned softmax attention over depth. Off by default (kill switch).
+    # When enabled, layers are partitioned into N blocks; cross-block attention uses
+    # block-level summaries, intra-block uses standard uniform accumulation.
+    use_block_attn_res: bool = False
+    block_attn_res_n_blocks: int = 8
 
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+
+class BlockAttnRes(nn.Module):
+    """One AttnRes call site (pre-attn or pre-MLP). Holds a learned pseudo-query w
+    and an RMSNorm for the key representations. The forward pass computes softmax
+    attention over a list of source tensors (block summaries + partial block + embedding)
+    and returns the weighted aggregate.
+
+    The pseudo-query w is zero-initialized, so at init all sources get uniform weight
+    1/K and the output approximates a standard equal-weight residual average.
+    """
+    def __init__(self, n_embd, eps=1e-6):
+        super().__init__()
+        self.w = nn.Parameter(torch.zeros(n_embd))
+        self.eps = eps
+
+    def forward(self, sources):
+        """
+        Args:
+            sources: list of (B, T, d) tensors to attend over.
+        Returns:
+            (B, T, d) softmax-weighted aggregate of sources.
+        """
+        stacked = torch.stack(sources, dim=0)                          # (K, B, T, d)
+        keys = stacked * torch.rsqrt(stacked.pow(2).mean(-1, keepdim=True) + self.eps)  # RMSNorm
+        logits = (keys * self.w.view(1, 1, 1, -1)).sum(-1)             # (K, B, T)
+        weights = logits.softmax(dim=0).to(dtype=stacked.dtype)         # softmax over sources, match dtype
+        return torch.einsum('kbt,kbtd->btd', weights, stacked)
+
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
@@ -256,6 +290,14 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+    def attn_forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
+        """Norm + attention sub-block, without the residual add. Used by AttnRes path."""
+        return self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+    def mlp_forward(self, x):
+        """Norm + MLP sub-block, without the residual add. Used by AttnRes path."""
+        return self.mlp(norm(x))
+
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
@@ -285,6 +327,10 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        # Block AttnRes: learned softmax attention over depth (off by default)
+        if config.use_block_attn_res:
+            self.attn_res_pre_attn = nn.ModuleList([BlockAttnRes(config.n_embd) for _ in range(config.n_layer)])
+            self.attn_res_pre_mlp = nn.ModuleList([BlockAttnRes(config.n_embd) for _ in range(config.n_layer)])
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
         self.smear_gate = Linear(24, 1, bias=False)
         self.smear_lambda = nn.Parameter(torch.zeros(1))
@@ -343,6 +389,13 @@ class GPT(nn.Module):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+
+        # Block AttnRes pseudo-queries: zero-init → uniform attention at start
+        if self.config.use_block_attn_res:
+            for m in self.attn_res_pre_attn:
+                torch.nn.init.zeros_(m.w)
+            for m in self.attn_res_pre_mlp:
+                torch.nn.init.zeros_(m.w)
 
         # Smear/backout scalars and smear gate must be explicitly initialized 
         torch.nn.init.zeros_(self.smear_lambda)
@@ -509,6 +562,10 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        # Count AttnRes pseudo-queries if enabled (1D params, naturally scalars)
+        if self.config.use_block_attn_res:
+            scalars += sum(m.w.numel() for m in self.attn_res_pre_attn)
+            scalars += sum(m.w.numel() for m in self.attn_res_pre_mlp)
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -529,6 +586,10 @@ class GPT(nn.Module):
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
+        # Block AttnRes pseudo-queries: 1D scalar-like params, group with resid (LR×0.01)
+        if self.config.use_block_attn_res:
+            attn_res_w_params = [m.w for m in self.attn_res_pre_attn] + [m.w for m in self.attn_res_pre_mlp]
+            resid_params = resid_params + attn_res_w_params
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
@@ -600,12 +661,45 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-            if i == backout_layer:
-                x_backout = x
+        if self.config.use_block_attn_res:
+            # Block AttnRes: replace uniform residual accumulation with learned softmax
+            # attention over depth. Layers are partitioned into N blocks; completed blocks
+            # are saved as summaries. Each layer uses attn_res_pre_attn/attn_res_pre_mlp to
+            # compute a weighted aggregate of (block_summaries + embedding + partial_block)
+            # before feeding into the sub-layer.
+            n_blocks = self.config.block_attn_res_n_blocks
+            block_size = max(1, n_layer // n_blocks)
+            block_summaries = []   # one (B,T,d) tensor per completed block
+            partial_block = x.clone()  # running intra-block sum
+            for i, block in enumerate(self.transformer.h):
+                # Pre-attn: AttnRes over completed blocks + embedding + partial
+                sources = block_summaries + [x0, partial_block]
+                x_attn = self.attn_res_pre_attn[i](sources)
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                attn_out = block.attn_forward(x_attn, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                partial_block = partial_block + attn_out
+                # Pre-MLP: AttnRes (with updated partial_block after attn)
+                sources = block_summaries + [x0, partial_block]
+                x_mlp = self.attn_res_pre_mlp[i](sources)
+                mlp_out = block.mlp_forward(x_mlp)
+                partial_block = partial_block + mlp_out
+                # Apply lambdas as post-hoc scaling on the layer output
+                x = self.resid_lambdas[i] * partial_block + self.x0_lambdas[i] * x0
+                partial_block = x
+                # Backout cache (same as standard path)
+                if i == backout_layer:
+                    x_backout = x
+                # Block boundary: save completed block summary, continue with current x
+                if (i + 1) % block_size == 0 and i < n_layer - 1:
+                    block_summaries.append(x.clone())
+        else:
+            # Standard path: uniform residual accumulation (unchanged)
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                if i == backout_layer:
+                    x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout

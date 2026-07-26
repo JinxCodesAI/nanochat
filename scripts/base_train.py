@@ -56,6 +56,9 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--varlen-doc-attn", dest="varlen_doc_attn", action="store_true", default=True, help="use varlen attention with document isolation (requires FA3)")
 parser.add_argument("--no-varlen-doc-attn", dest="varlen_doc_attn", action="store_false", help="fall back to crop-and-discard packing + plain causal attention")
+# Block Attention Residuals (AttnRes): learned softmax attention over depth
+parser.add_argument("--block-attn-res", action="store_true", default=False, help="Enable Block AttnRes: replace uniform residual accumulation with learned softmax over depth")
+parser.add_argument("--block-attn-res-n-blocks", type=int, default=8, help="Number of blocks for Block AttnRes (only used if --block-attn-res)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -142,6 +145,8 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         use_varlen_doc_attn=args.varlen_doc_attn,
+        use_block_attn_res=args.block_attn_res,
+        block_attn_res_n_blocks=args.block_attn_res_n_blocks,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
