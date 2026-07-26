@@ -41,6 +41,11 @@ class GPTConfig:
     # document boundaries from the dataloader. When False, falls back to plain
     # causal attention with the crop-and-discard packing policy.
     use_varlen_doc_attn: bool = True
+    # Chunk size for the chunked cross-entropy loss. The lm_head output (B, T, vocab) in fp32
+    # is O(B*T*vocab) bytes and dominates peak HBM at training scale (e.g. 4 GB at B=16,
+    # T=2048, vocab=32768, fp32). Chunking along T avoids materializing the full buffer.
+    # Set to T (or larger) to fall back to the one-shot path.
+    loss_chunk_size: int = 512
 
 
 def norm(x):
@@ -606,21 +611,94 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
+        # Forward the lm_head and compute loss in chunks along T to avoid materializing the
+        # full (B, T, vocab) fp32 logits buffer in HBM. Peak buffer size drops from
+        # B*T*vocab*4 bytes to B*chunk_size*vocab*4 bytes (e.g. 4 GB -> 1 GB at B=16, vocab=32K).
+        # Mathematically identical to F.cross_entropy(reduction=loss_reduction, ignore_index=-1).
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
+            return self._chunked_loss(x, targets, loss_reduction=loss_reduction)
+
+        # Inference / sampling path: return softcapped logits in COMPUTE_DTYPE.
+        # The softcap is applied in fp32 for numerical stability (matches training),
+        # then cast back to COMPUTE_DTYPE so callers see bf16 logits. Note that
+        # `logits.to(torch.float32)` does materialize a full (B, T, vocab) fp32 buffer
+        # in HBM (eager mode does not elide this cast). This is fine here because
+        # generate() only consumes the last token's logits; the fp32 buffer is transient.
+        softcap = 15
+        logits = self.lm_head(x)  # (B, T, padded_vocab_size)
+        logits = logits[..., :self.config.vocab_size]
+        logits = (softcap * torch.tanh(logits.to(torch.float32) / softcap)).to(logits.dtype)
+        return logits
+
+    def _chunked_loss(self, x, targets, loss_reduction='mean'):
+        """
+        Compute the cross-entropy loss in chunks along the sequence dimension.
+
+        Why: at training scale, the lm_head output (B, T, vocab) in fp32 is the single
+        largest activation buffer (e.g. 4 GB at B=16, T=2048, vocab=32768, fp32).
+        Chunking along T reduces the peak buffer to (B, chunk, vocab) per iteration.
+
+        Math: identical to F.cross_entropy(logits, targets, ignore_index=-1, reduction=...).
+        - 'mean': average NLL over non-ignored tokens (matches PyTorch's reduction='mean' with ignore_index).
+        - 'none': per-token NLL tensor of shape (B, T) (ignored positions are 0).
+
+        Args:
+            x: hidden states, shape (B, T, n_embd), in COMPUTE_DTYPE
+            targets: target token ids, shape (B, T), dtype long; use -1 for ignored positions
+            loss_reduction: 'mean' or 'none' (also accepts 'sum' for completeness)
+        """
+        B, T, _ = x.shape
+        V = self.config.vocab_size
+        softcap = 15
+
+        # If T is small enough to fit in one chunk, skip the chunking overhead and use
+        # the one-shot path. This also makes the common inference / short-seq case fast.
+        chunk_size = self.config.loss_chunk_size
+        if chunk_size <= 0 or chunk_size >= T:
+            logits = self.lm_head(x)[..., :V]            # (B, T, vocab)
+            logits = logits.float()                      # fp32 for stable softcap + CE
+            logits = softcap * torch.tanh(logits / softcap)
+            return F.cross_entropy(
+                logits.view(-1, V), targets.view(-1),
+                ignore_index=-1, reduction=loss_reduction,
+            )
+
+        # Chunked path: keep at most (B, chunk, vocab) fp32 logits live at once.
+        if loss_reduction == 'mean':
+            # Accumulate sum-of-NLL and count-of-valid-tokens across chunks, divide at the end.
+            # This matches F.cross_entropy(reduction='mean', ignore_index=-1) exactly:
+            # the denominator excludes ignored positions.
+            total_sum = x.new_zeros((), dtype=torch.float32)
+            total_count = x.new_zeros((), dtype=torch.int64)
+            for t0 in range(0, T, chunk_size):
+                t1 = min(t0 + chunk_size, T)
+                chunk_logits = self.lm_head(x[:, t0:t1])[..., :V].float()
+                chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+                chunk_targets = targets[:, t0:t1]
+                total_sum = total_sum + F.cross_entropy(
+                    chunk_logits.reshape(-1, V), chunk_targets.reshape(-1),
+                    ignore_index=-1, reduction='sum',
+                )
+                # count of non-ignored targets in this chunk
+                total_count = total_count + (chunk_targets >= 0).sum()
+            # clamp(min=1) avoids 0/0 when all targets in a micro-batch are ignored
+            return total_sum / total_count.clamp(min=1)
+
+        # 'none' (or 'sum'): write per-token losses into a pre-allocated (B, T) buffer.
+        # For 'sum' we still allocate the full buffer and reduce at the end; this is rare.
+        per_token = torch.empty(B, T, dtype=torch.float32, device=x.device)
+        for t0 in range(0, T, chunk_size):
+            t1 = min(t0 + chunk_size, T)
+            chunk_logits = self.lm_head(x[:, t0:t1])[..., :V].float()
+            chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+            chunk_targets = targets[:, t0:t1]
+            per_token[:, t0:t1] = F.cross_entropy(
+                chunk_logits.reshape(-1, V), chunk_targets.reshape(-1),
+                ignore_index=-1, reduction='none',
+            ).view(B, t1 - t0)
+        if loss_reduction == 'sum':
+            return per_token.sum()
+        return per_token
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

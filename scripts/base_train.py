@@ -27,6 +27,8 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear, _flatten_doc_offsets
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader_metrics import DataloaderTimer, QueueDepthTimer
+from nanochat.dataloader_async import async_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -336,6 +338,12 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     device=device, resume_state_dict=dataloader_resume_state_dict,
     emit_doc_offsets=args.varlen_doc_attn,
 )
+# Async loader: parquet read + tokenization overlap with GPU compute in a background thread.
+# QueueDepthTimer measures consumer-side starvation (Queue.get() blocking = GPU idle)
+# plus producer-side dataloader throughput. maxsize=2 keeps one batch in flight + one ready.
+# Val loader is left synchronous (only used occasionally).
+train_loader = async_loader(train_loader, maxsize=2)
+train_loader = QueueDepthTimer(train_loader)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
     tokenizer, args.device_batch_size, args.max_seq_len, split="val",
     device=device, emit_doc_offsets=args.varlen_doc_attn,
@@ -598,7 +606,20 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    # Roll up dataloader timing for this step
+    train_loader.end_step()
+    dw = train_loader.summary()
+    queue_get_total_ms = dw["queue_get_total_ms"]
+    queue_get_max_ms = dw["queue_get_max_ms"]
+    producer_total_ms = dw["producer_total_ms"]
+    producer_max_ms = dw["producer_max_ms"]
+    starved_steps = dw["queue_starved_steps"]
+    starved_threshold_ms = dw["queue_starved_threshold_ms"]
+    # GPU idle from data = time consumer blocked on Queue.get() beyond threshold noise.
+    # We approximate this as max(0, queue_get_total_ms - noise_floor_per_call * calls).
+    # Simpler: any step where queue_get_max_ms > threshold counts as starved.
+    verdict = "DATA_BOTTLENECK" if queue_get_max_ms > starved_threshold_ms else "data_hidden"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | dataloader: producer {producer_total_ms:.0f}ms/step (max {producer_max_ms:.0f}ms), queue_get {queue_get_total_ms:.0f}ms (max {queue_get_max_ms:.1f}ms, threshold {starved_threshold_ms:.0f}ms) | starved_steps: {starved_steps} | {verdict} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -610,6 +631,11 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/dataloader_producer_total_ms": producer_total_ms,
+            "train/dataloader_producer_max_ms": producer_max_ms,
+            "train/dataloader_queue_get_total_ms": queue_get_total_ms,
+            "train/dataloader_queue_get_max_ms": queue_get_max_ms,
+            "train/dataloader_starved_steps": starved_steps,
         }
         wandb_run.log(log_data)
 
