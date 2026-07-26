@@ -75,7 +75,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000,
+    emit_doc_offsets=False, max_docs_per_row=64,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -92,6 +93,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     - Every row starts with BOS
     - 100% utilization (no padding, every token is trained on)
     - Approximately 35% of all tokens are discarded due to cropping
+
+    When `emit_doc_offsets=True`, also yields a `(B, max_docs_per_row + 1)` int32
+    tensor of per-row cumulative document offsets. The first column is always 0
+    (BOS of doc 0). Each subsequent column is the cumulative end position of the
+    next doc within the row. Unused slots are padded with `T+1` (so they describe
+    zero-length docs at the row boundary, which varlen attention treats as
+    no-ops). Used by `flash_attn_varlen_func` to enforce document isolation.
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
@@ -108,20 +116,37 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         for tokens in token_lists:
             doc_buffer.append(tokens)
 
-    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
-    # This gives us contiguous views and a single HtoD transfer
+    # Pre-allocate buffers once:
+    #   row_buffer: (B, T+1) for assembling rows from doc pieces
+    #   cpu_buffer: [inputs (B*T) | targets (B*T)] pinned memory for staging
+    #   gpu_buffer: same layout, on-device (single HtoD transfer)
+    #   doc_offsets: (B, max_docs_per_row + 1) int32, cumulative doc boundaries per row
+    #   cpu_doc_offsets: pinned copy of doc_offsets
+    #   gpu_doc_offsets: on-device copy
     use_cuda = device == "cuda"
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
+    # Per-row doc boundaries. Layout: doc_offsets[b, 0] = 0 (doc 0 starts at 0),
+    # doc_offsets[b, k] = end position of doc k-1 in row b (exclusive). Unused slots
+    # get the row_capacity value so they represent zero-length docs at the boundary.
+    if emit_doc_offsets:
+        cpu_doc_offsets = torch.zeros((B, max_docs_per_row + 1), dtype=torch.int32, pin_memory=use_cuda)
+        gpu_doc_offsets = torch.zeros((B, max_docs_per_row + 1), dtype=torch.int32, device=device)
+    else:
+        cpu_doc_offsets = None
+        gpu_doc_offsets = None
 
     while True:
         for row_idx in range(B):
             pos = 0
+            doc_idx = 0  # number of docs placed in this row so far
+            if emit_doc_offsets:
+                cpu_doc_offsets[row_idx, 0] = 0  # first doc always starts at 0
             while pos < row_capacity:
                 # Ensure buffer has documents
                 while len(doc_buffer) < buffer_size:
@@ -143,12 +168,37 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     doc_len = len(doc)
                     row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
                     pos += doc_len
+                    if emit_doc_offsets:
+                        # Record this doc's end position; varlen convention is
+                        # cu_seqlens doc_k = doc_offsets[b, k] (end of doc k).
+                        doc_idx += 1
+                        assert doc_idx <= max_docs_per_row, (
+                            f"Row {row_idx} exceeds max_docs_per_row={max_docs_per_row}; "
+                            f"increase the parameter or tighten document packing."
+                        )
+                        cpu_doc_offsets[row_idx, doc_idx] = pos
                 else:
                     # No doc fits - crop shortest in buffer to fill remaining and minimize waste
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
+                    if emit_doc_offsets:
+                        # The crop is the tail of a doc; we still record it as a doc
+                        # boundary so the model sees a single doc spanning this row.
+                        # In varlen-flavored attention that's fine — the cropped tail
+                        # simply doesn't attend to anything (it has no BOS).
+                        doc_idx += 1
+                        assert doc_idx <= max_docs_per_row, (
+                            f"Row {row_idx} exceeds max_docs_per_row={max_docs_per_row}; "
+                            f"increase the parameter or tighten document packing."
+                        )
+                        cpu_doc_offsets[row_idx, doc_idx] = pos
+
+            # Fill unused doc_offsets slots for THIS row with row_capacity so they
+            # describe zero-length docs at the row boundary (varlen attention no-ops them).
+            if emit_doc_offsets and doc_idx < max_docs_per_row:
+                cpu_doc_offsets[row_idx, doc_idx + 1:] = row_capacity
 
         # Copy to pinned CPU buffer, then single HtoD transfer
         cpu_inputs.copy_(row_buffer[:, :-1])
@@ -157,10 +207,25 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
         # Single HtoD copy into persistent GPU buffer and yield
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        yield inputs, targets, state_dict
+        if emit_doc_offsets:
+            gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+            gpu_doc_offsets.copy_(cpu_doc_offsets, non_blocking=use_cuda)
+            yield inputs, targets, gpu_doc_offsets, state_dict
+        else:
+            gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+            yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
-    """Helper that omits state_dict from yields."""
-    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
-        yield inputs, targets
+    """Helper that omits state_dict from yields.
+
+    When emit_doc_offsets=True is passed, doc_offsets is preserved (so the
+    caller can pass it to the model). When emit_doc_offsets=False (default),
+    yields the legacy 2-tuple (inputs, targets).
+    """
+    for item in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
+        if len(item) == 4:
+            inputs, targets, doc_offsets, _state_dict = item
+            yield inputs, targets, doc_offsets
+        else:
+            inputs, targets, _state_dict = item
+            yield inputs, targets

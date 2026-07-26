@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Document isolation: when True, training uses flash_attn_varlen_func with
+    # document boundaries from the dataloader. When False, falls back to plain
+    # causal attention with the crop-and-discard packing policy.
+    use_varlen_doc_attn: bool = True
 
 
 def norm(x):
@@ -64,6 +68,86 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+
+def _flatten_doc_offsets(doc_offsets, B, T):
+    """
+    Convert the per-row (B, max_docs+1) doc-boundary tensor into a fixed-shape
+    1D cu_seqlens tensor for FA3's varlen interface.
+
+    The output is always padded to the maximum possible size
+    (B * max_docs_per_row + 1) so that torch.compile(dynamic=False) sees a
+    static tensor shape across batches.  Trailing entries past the real docs
+    are filled with B*T, which FA3 treats as zero-length sequences (no-ops).
+
+    The model should use max_seqlen = T (the row length) as a safe, constant
+    upper bound for FA3's workspace allocation.  This avoids torch.compile
+    scalar guards on a per-batch value that varies with doc-length distribution.
+
+    Dataloader layout: doc_offsets[b, 0] = 0 (start of doc 0), and
+    doc_offsets[b, k] = end position of doc k-1 in row b (for k >= 1). Unused
+    trailing slots are filled with row_capacity = T+1.
+
+    Returns:
+        cu_seqlens: 1D int32 tensor of fixed length (B*max_docs_per_row + 1).
+    """
+    assert doc_offsets.dim() == 2 and doc_offsets.size(0) == B, (
+        f"doc_offsets must be (B, max_docs+1), got {tuple(doc_offsets.shape)}"
+    )
+    max_docs_per_row = doc_offsets.size(1) - 1
+    max_cu_len = B * max_docs_per_row + 1  # fixed output length
+
+    # `real` masks out the padding slots (those equal to row_capacity = T+1).
+    offs = doc_offsets.to(torch.int64)
+    real = offs < (T + 1)
+    # Number of real entries per row K_b (includes column 0 = the row-start marker).
+    row_real_count = real.sum(dim=1)  # (B,) int64
+    # Per-row token offset in the flat sequence.
+    row_tok_offset = torch.arange(B, dtype=torch.int64, device=offs.device) * T
+    parts = []
+    for b in range(B):
+        K = int(row_real_count[b].item())
+        row_ends = []
+        if K > 1:
+            for k in range(1, K):
+                row_ends.append(int(offs[b, k].item()) + int(row_tok_offset[b].item()))
+        if K > 1:
+            last_doc_end = int(offs[b, K - 1].item())
+        else:
+            last_doc_end = 0
+        if last_doc_end < T:
+            row_ends.append((b + 1) * T)
+        if row_ends:
+            parts.append(torch.tensor(row_ends, dtype=torch.int32, device=offs.device))
+    # Assemble: [0, ...all doc-ends..., B*T]
+    if parts:
+        body = torch.cat(parts)
+    else:
+        body = torch.empty(0, dtype=torch.int32, device=offs.device)
+    cu_raw = torch.cat([torch.zeros(1, dtype=torch.int32, device=offs.device), body,
+                         torch.tensor([B * T], dtype=torch.int32, device=offs.device)])
+    # Remove consecutive duplicates from row-cap / final B*T overlap.
+    if cu_raw.numel() >= 2:
+        keep = torch.ones(cu_raw.numel(), dtype=torch.bool, device=offs.device)
+        keep[1:] = (cu_raw[1:] != cu_raw[:-1])
+        cu = cu_raw[keep]
+    else:
+        cu = cu_raw
+
+    # Sanity checks
+    assert cu[0].item() == 0, f"cu_seqlens[0] must be 0, got {cu[0].item()}"
+    if cu.numel() > 1:
+        assert (cu[1:] >= 1).all(), f"All doc-ends must be >= 1, got first zeros at: {(cu[1:] == 0).nonzero(as_tuple=True)[0][:5].tolist()}"
+        diffs = cu[1:] - cu[:-1]
+        assert (diffs > 0).all(), f"cu_seqlens must be strictly increasing, got non-positive diffs at indices: {(diffs <= 0).nonzero(as_tuple=True)[0][:5].tolist()}"
+        assert cu[-1].item() == B * T, f"cu_seqlens must end at total tokens {B*T}, got {cu[-1].item()}"
+        assert (cu[-1] >= cu[-2]).item(), f"Last entry must be >= second-last, got {cu[-2].item()} >= {cu[-1].item()}"
+
+    # Pad to fixed length (trailing B*T = zero-length sequences to FA3).
+    if cu.numel() < max_cu_len:
+        pad = cu.new_full((max_cu_len - cu.numel(),), B * T)
+        cu = torch.cat([cu, pad])
+    return cu.contiguous()
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -81,7 +165,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -105,7 +189,22 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
+        if kv_cache is None and cu_seqlens is not None:
+            # Document-isolated training via varlen attention: the cu_seqlens
+            # tensor was built once in GPT.forward (outside torch.compile) from
+            # the doc_offsets buffer. Row-major flattening matches the dataloader
+            # layout.
+            q_flat = q.reshape(-1, self.n_head, self.head_dim)
+            k_flat = k.reshape(-1, self.n_kv_head, self.head_dim)
+            v_flat = v.reshape(-1, self.n_kv_head, self.head_dim)
+            y_flat = flash_attn.flash_attn_varlen_func(
+                q_flat, k_flat, v_flat,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                causal=True, window_size=window_size,
+            )
+            y = y_flat.reshape(B, T, self.n_head, self.head_dim)
+        elif kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
@@ -147,8 +246,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.mlp(norm(x))
         return x
 
@@ -456,7 +555,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', cu_seqlens=None, max_seqlen=0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -499,7 +598,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

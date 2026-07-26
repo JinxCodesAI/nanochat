@@ -29,8 +29,20 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
-        x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        nxt = next(batch_iter)
+        # dataloader yields 3-tuples (x, y, doc_offsets) when varlen is on,
+        # 2-tuples (x, y) when off.
+        if isinstance(nxt, tuple) and len(nxt) == 3:
+            x, y, doc_offsets = nxt
+            B, T = x.shape
+            from nanochat.gpt import _flatten_doc_offsets
+            cu_seqlens = _flatten_doc_offsets(doc_offsets, B, T)
+            max_seqlen = T  # constant safe upper bound, avoids compile scalar guards
+        else:
+            x, y = nxt
+            cu_seqlens = None
+            max_seqlen = 0
+        loss2d = model(x, y, loss_reduction='none', cu_seqlens=cu_seqlens, max_seqlen=max_seqlen) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, _flatten_doc_offsets
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -52,6 +52,8 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--varlen-doc-attn", dest="varlen_doc_attn", action="store_true", default=True, help="use varlen attention with document isolation (requires FA3)")
+parser.add_argument("--no-varlen-doc-attn", dest="varlen_doc_attn", action="store_false", help="fall back to crop-and-discard packing + plain causal attention")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +139,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        use_varlen_doc_attn=args.varlen_doc_attn,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -328,9 +331,30 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+    tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+    device=device, resume_state_dict=dataloader_resume_state_dict,
+    emit_doc_offsets=args.varlen_doc_attn,
+)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
+    tokenizer, args.device_batch_size, args.max_seq_len, split="val",
+    device=device, emit_doc_offsets=args.varlen_doc_attn,
+)
+# Kick off the load of the very first batch of data. The dataloader yields
+# 4-tuples when emit_doc_offsets=True (varlen path) and 3-tuples otherwise.
+first = next(train_loader)
+if args.varlen_doc_attn:
+    x, y, doc_offsets, dataloader_state_dict = first
+    cu_seqlens = _flatten_doc_offsets(doc_offsets, args.device_batch_size, args.max_seq_len)
+    max_seqlen = args.max_seq_len  # constant T: safe upper bound for FA3 workspace; avoids torch.compile scalar guard
+    real_docs = (cu_seqlens[:-1] != cu_seqlens[1:]).sum().item()  # count non-zero-length segments
+    print0(f"[varlen] First batch: B={args.device_batch_size} T={args.max_seq_len}, real_docs={real_docs}, cu_shape={tuple(cu_seqlens.shape)}")
+    print0(f"[varlen] cu_seqlens[:10] = {cu_seqlens[:10].tolist()}, ...[-5:] = {cu_seqlens[-5:].tolist()}")
+    print0(f"[varlen] doc_offsets row 0[:8] = {doc_offsets[0, :8].tolist()}")
+else:
+    x, y, dataloader_state_dict = first
+    cu_seqlens = None
+    max_seqlen = 0
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -508,14 +532,24 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # Prefetch the next batch while the GPU is busy with forward/backward.
+        # 4-tuple form when varlen is enabled, 3-tuple otherwise.
+        nxt = next(train_loader)
+        if args.varlen_doc_attn:
+            x, y, doc_offsets, dataloader_state_dict = nxt
+            cu_seqlens = _flatten_doc_offsets(doc_offsets, args.device_batch_size, args.max_seq_len)
+            # max_seqlen = T (constant) — set once above, never changes
+        else:
+            x, y, dataloader_state_dict = nxt
+            cu_seqlens = None
+            max_seqlen = 0
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)

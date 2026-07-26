@@ -185,6 +185,50 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 
 
+def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                            max_seqlen_q, max_seqlen_k,
+                            causal=False, window_size=(-1, -1)):
+    """
+    Varlen Flash Attention for training with document isolation.
+
+    Each entry in the row-flattened sequence is treated as one of multiple
+    documents via the cumulative-length tensors. No token in one document can
+    attend to any token in another. Used by nanochat's BOS-aligned bestfit
+    dataloader to enforce document boundaries architecturally rather than via
+    the BOS-embedding heuristic.
+
+    Args:
+        q, k, v: Flattened sequence tensors of shape (total_tokens, H, D).
+            In nanochat, this is built by concatenating the per-row tokens
+            in a deterministic order (typically row-major).
+        cu_seqlens_q, cu_seqlens_k: 1D int32 tensors of cumulative sequence
+            lengths. For self-attention they are equal. Must be on the same
+            device as q/k/v.
+        max_seqlen_q, max_seqlen_k: int scalars (the longest doc in the batch).
+        causal: Whether to use causal masking within each doc.
+        window_size: (left, right) sliding window. -1 means unlimited.
+
+    Returns:
+        Output tensor of shape (total_tokens, H, D), same layout as inputs.
+
+    Requires FA3. There is no SDPA varlen fallback (PyTorch SDPA does not
+    accept cu_seqlens). If your hardware does not have FA3, fall back to the
+    crop-and-discard path by passing `emit_doc_offsets=False` to the dataloader.
+    """
+    if USE_FA3:
+        return _fa3.flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            causal=causal, window_size=window_size,
+        )
+    raise RuntimeError(
+        "flash_attn_varlen_func requires Flash Attention 3, which is not "
+        "available on this hardware. Either disable use_varlen_doc_attn or "
+        "install FA3 (Hopper / Ada / Ampere)."
+    )
+
+
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
@@ -192,4 +236,5 @@ from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,
+    flash_attn_varlen_func=flash_attn_varlen_func,
 )
