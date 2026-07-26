@@ -75,15 +75,10 @@ class BlockAttnRes(nn.Module):
         """
         Args:
             sources: pre-stacked tensor of shape (K, B, T, d).
-                     (Also accepts list of tensors for backward compatibility.)
         Returns:
             (B, T, d) softmax-weighted aggregate of sources.
         """
-        if isinstance(sources, list):
-            # Backward-compat path: torch.stack of Python list (breaks torch.compile)
-            stacked = torch.stack(sources, dim=0)  # (K, B, T, d)
-        else:
-            stacked = sources
+        stacked = sources
         keys = stacked * torch.rsqrt(stacked.pow(2).mean(-1, keepdim=True) + self.eps)  # RMSNorm
         logits = (keys * self.w.view(1, 1, 1, -1)).sum(-1)             # (K, B, T)
         weights = logits.softmax(dim=0).to(dtype=stacked.dtype)         # softmax over sources, match dtype
@@ -676,35 +671,35 @@ class GPT(nn.Module):
             #
             # Key design: intra_accum is the RAW sum of layer outputs (b_n^i in the
             # paper), never rebased. Block summaries store that sum at boundaries.
-            # A pre-allocated tensor block_buf replaces Python list ops to avoid
-            # torch.compile graph breaks (list append/concat + torch.stack of
-            # variable-length lists forces eager-mode fallback).
+            # Source tensors are built functionally via torch.cat (no in-place
+            # mutations) to keep torch.compile / AOTAutograd happy.
             n_blocks = self.config.block_attn_res_n_blocks
             block_size = max(1, n_layer // n_blocks)
-            # Pre-allocated buffer: (max_blocks, B, T, d) — fixed shape, torch.compile-safe
-            max_blocks = (n_layer + block_size - 1) // block_size
-            block_buf = x.new_zeros(max_blocks, B, T, x.size(-1))
-            num_blocks = 0
             # intra_accum: running sum of layer outputs within current block (b_n^i).
             # Initially carries the embedding (b_0 = h_1 in the paper), which serves
             # as the first source for layer 0's AttnRes.
             intra_accum = x0
-            # Scratch buffer for stacking sources before AttnRes call.
-            # At most num_blocks completed summaries + 1 intra_accum tensor.
-            src_buf = x.new_zeros(max_blocks + 1, B, T, x.size(-1))
+            # Completed block summaries: pre-allocated list to avoid .append() inside
+            # torch.compile (index-based assignment is more dynamo-friendly).
+            max_blocks = (n_layer + block_size - 1) // block_size
+            block_summaries = [None] * max_blocks
+            num_blocks = 0
             for i, block in enumerate(self.transformer.h):
                 # --- Pre-attn: AttnRes over completed blocks + intra_accum ---
-                n_src = num_blocks + 1  # block summaries + intra_accum
-                if num_blocks > 0:
-                    src_buf[:num_blocks].copy_(block_buf[:num_blocks])
-                src_buf[num_blocks] = intra_accum
-                x_attn = self.attn_res_pre_attn[i](src_buf[:n_src])
+                # Build source tensor functionally: torch.cat avoids in-place tensor ops
+                active_blocks = block_summaries[:num_blocks]
+                src_parts = [b.unsqueeze(0) for b in active_blocks]
+                src_parts.append(intra_accum.unsqueeze(0))
+                sources = torch.cat(src_parts, dim=0)  # (num_blocks+1, B, T, d)
+                x_attn = self.attn_res_pre_attn[i](sources)
                 ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
                 attn_out = block.attn_forward(x_attn, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 intra_accum = intra_accum + attn_out
                 # --- Pre-MLP: AttnRes (with updated intra_accum after attn) ---
-                src_buf[num_blocks] = intra_accum
-                x_mlp = self.attn_res_pre_mlp[i](src_buf[:n_src])
+                src_parts_mlp = [b.unsqueeze(0) for b in active_blocks]
+                src_parts_mlp.append(intra_accum.unsqueeze(0))
+                sources_mlp = torch.cat(src_parts_mlp, dim=0)
+                x_mlp = self.attn_res_pre_mlp[i](sources_mlp)
                 mlp_out = block.mlp_forward(x_mlp)
                 intra_accum = intra_accum + mlp_out
                 # --- Apply lambdas: scale the fully-accumulated intra-block sum ---
@@ -714,7 +709,7 @@ class GPT(nn.Module):
                     x_backout = x
                 # --- Block boundary: save completed block summary, reset accumulator ---
                 if (i + 1) % block_size == 0 and i < n_layer - 1:
-                    block_buf[num_blocks] = intra_accum  # save raw sum (paper's b_n)
+                    block_summaries[num_blocks] = intra_accum  # save raw sum (paper's b_n)
                     num_blocks += 1
                     intra_accum = torch.zeros_like(x0)  # fresh accumulator for next block
         else:
