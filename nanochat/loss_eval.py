@@ -36,7 +36,8 @@ def evaluate_bpb(model, batches, steps, token_bytes):
             x, y, doc_offsets = nxt
             B, T = x.shape
             from nanochat.gpt import _flatten_doc_offsets
-            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+            cu_seqlens = _flatten_doc_offsets(doc_offsets, B, T)
+            max_seqlen = T  # constant safe upper bound, avoids compile scalar guards
         else:
             x, y = nxt
             cu_seqlens = None

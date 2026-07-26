@@ -31,23 +31,19 @@ def make_fake_doc(tokenizer, n_tokens, bos=True):
 
 
 def test_flatten_doc_offsets_basic():
-    """2 rows, 2 docs each, plus padding."""
+    """2 rows, 2 docs each, plus padding. Fixed-shape output."""
     B, T = 2, 10
-    # row 0: docs ending at positions 3 and 7
-    # row 1: docs ending at positions 4 and 6
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([
         [0, 3, 7, T_plus_1, T_plus_1],
         [0, 4, 6, T_plus_1, T_plus_1],
     ], dtype=torch.int32)
-    cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+    cu = _flatten_doc_offsets(doc_offsets, B, T)
     # max_docs_per_row = 4, so max_cu_len = 2*4+1 = 9.
     # Real cu: [0, 3, 7, 10, 14, 16, 20], padded with 20 to length 9.
     expected = torch.tensor([0, 3, 7, 10, 14, 16, 20, 20, 20], dtype=torch.int32)
     assert cu.shape == (9,), f"cu_seqlens shape mismatch: {cu.shape}, expected (9,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
-    # doc/cap lengths: [3, 4, 4, 4, 2, 0, 0, 0] -> max = 4
-    assert max_seqlen == 4, f"max_seqlen mismatch: {max_seqlen} vs 4"
     print("test_flatten_doc_offsets_basic PASSED")
 
 
@@ -56,14 +52,12 @@ def test_flatten_doc_offsets_single_doc():
     B, T = 1, 8
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([[0, T_plus_1, T_plus_1, T_plus_1]], dtype=torch.int32)
-    cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+    cu = _flatten_doc_offsets(doc_offsets, B, T)
     # max_docs_per_row = 3, so max_cu_len = 1*3+1 = 4.
     # Real cu: [0, 8], padded with 8 to length 4.
     expected = torch.tensor([0, 8, 8, 8], dtype=torch.int32)
     assert cu.shape == (4,), f"cu_seqlens shape mismatch: {cu.shape}, expected (4,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
-    # Segments: [8, 0, 0] -> max_seqlen = T (cap covers all tokens)
-    assert max_seqlen == 8, f"max_seqlen mismatch: {max_seqlen} vs 8"
     print("test_flatten_doc_offsets_single_doc PASSED")
 
 
@@ -72,34 +66,28 @@ def test_flatten_doc_offsets_padding_only():
     B, T = 2, 5
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([[0, T_plus_1, T_plus_1], [0, T_plus_1, T_plus_1]], dtype=torch.int32)
-    cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+    cu = _flatten_doc_offsets(doc_offsets, B, T)
     # max_docs_per_row = 2, so max_cu_len = 2*2+1 = 5.
     # Real cu: [0, 5, 10], padded with 10 to length 5.
     expected = torch.tensor([0, 5, 10, 10, 10], dtype=torch.int32)
     assert cu.shape == (5,), f"cu_seqlens shape mismatch: {cu.shape}, expected (5,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
-    # Segments: [5, 5, 0, 0] -> max_seqlen = 5
-    assert max_seqlen == 5, f"max_seqlen mismatch: {max_seqlen} vs 5"
     print("test_flatten_doc_offsets_padding_only PASSED")
 
 
 def test_flatten_doc_offsets_crop_cap():
     """Single row where a short doc leaves a trailing cap segment.
-    This is the case where last_doc_end < T, so a cap at (b+1)*T is injected.
-    The cap segment length must be included in max_seqlen."""
+    This is the case where last_doc_end < T, so a cap at (b+1)*T is injected."""
     B, T = 1, 12
     T_plus_1 = T + 1
-    # One doc of length 5, then all padding. Cap covers remaining 7 tokens.
     doc_offsets = torch.tensor([[0, 5, T_plus_1, T_plus_1, T_plus_1]], dtype=torch.int32)
-    cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+    cu = _flatten_doc_offsets(doc_offsets, B, T)
     # max_docs_per_row = 4, max_cu_len = 1*4+1 = 5.
     # Real entries: col 0 (=0), col 1 (=5). K=2, last_doc_end=5 < T=12 => cap at 12.
     # cu = [0, 5, 12], padded to [0, 5, 12, 12, 12].
     expected = torch.tensor([0, 5, 12, 12, 12], dtype=torch.int32)
     assert cu.shape == (5,), f"cu_seqlens shape mismatch: {cu.shape}, expected (5,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
-    # Segments: doc=[5], cap=[7], padding=[0,0] -> max = 7
-    assert max_seqlen == 7, f"max_seqlen mismatch: {max_seqlen} vs 7"
     print("test_flatten_doc_offsets_crop_cap PASSED")
 
 

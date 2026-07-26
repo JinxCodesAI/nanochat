@@ -79,13 +79,16 @@ def _flatten_doc_offsets(doc_offsets, B, T):
     static tensor shape across batches.  Trailing entries past the real docs
     are filled with B*T, which FA3 treats as zero-length sequences (no-ops).
 
+    The model should use max_seqlen = T (the row length) as a safe, constant
+    upper bound for FA3's workspace allocation.  This avoids torch.compile
+    scalar guards on a per-batch value that varies with doc-length distribution.
+
     Dataloader layout: doc_offsets[b, 0] = 0 (start of doc 0), and
     doc_offsets[b, k] = end position of doc k-1 in row b (for k >= 1). Unused
     trailing slots are filled with row_capacity = T+1.
 
     Returns:
         cu_seqlens: 1D int32 tensor of fixed length (B*max_docs_per_row + 1).
-        max_seqlen: int, the longest doc or cap segment length in the batch.
     """
     assert doc_offsets.dim() == 2 and doc_offsets.size(0) == B, (
         f"doc_offsets must be (B, max_docs+1), got {tuple(doc_offsets.shape)}"
@@ -100,12 +103,6 @@ def _flatten_doc_offsets(doc_offsets, B, T):
     row_real_count = real.sum(dim=1)  # (B,) int64
     # Per-row token offset in the flat sequence.
     row_tok_offset = torch.arange(B, dtype=torch.int64, device=offs.device) * T
-    # Build cu_seqlens: a single leading 0, then for each row b:
-    #   offs[b, 1] + row_tok_offset[b]   (end of doc 0 in row b)
-    #   offs[b, 2] + row_tok_offset[b]   (end of doc 1 in row b)
-    #   ...
-    #   (b+1)*T  if the last doc's end < T  (caps row's trailing crop padding)
-    # The final entry is always B*T.
     parts = []
     for b in range(B):
         K = int(row_real_count[b].item())
@@ -128,8 +125,7 @@ def _flatten_doc_offsets(doc_offsets, B, T):
         body = torch.empty(0, dtype=torch.int32, device=offs.device)
     cu_raw = torch.cat([torch.zeros(1, dtype=torch.int32, device=offs.device), body,
                          torch.tensor([B * T], dtype=torch.int32, device=offs.device)])
-    # Remove consecutive duplicates that can arise when a row's last doc ends
-    # exactly at T and a per-row cap or the final B*T cap produces the same value.
+    # Remove consecutive duplicates from row-cap / final B*T overlap.
     if cu_raw.numel() >= 2:
         keep = torch.ones(cu_raw.numel(), dtype=torch.bool, device=offs.device)
         keep[1:] = (cu_raw[1:] != cu_raw[:-1])
@@ -137,9 +133,7 @@ def _flatten_doc_offsets(doc_offsets, B, T):
     else:
         cu = cu_raw
 
-    # -----------------------------------------------------------------
     # Sanity checks
-    # -----------------------------------------------------------------
     assert cu[0].item() == 0, f"cu_seqlens[0] must be 0, got {cu[0].item()}"
     if cu.numel() > 1:
         assert (cu[1:] >= 1).all(), f"All doc-ends must be >= 1, got first zeros at: {(cu[1:] == 0).nonzero(as_tuple=True)[0][:5].tolist()}"
@@ -148,15 +142,11 @@ def _flatten_doc_offsets(doc_offsets, B, T):
         assert cu[-1].item() == B * T, f"cu_seqlens must end at total tokens {B*T}, got {cu[-1].item()}"
         assert (cu[-1] >= cu[-2]).item(), f"Last entry must be >= second-last, got {cu[-2].item()} >= {cu[-1].item()}"
 
-    # Compute max_seqlen from ALL segments (including cap segments),
-    # then pad cu to fixed length so torch.compile(dynamic=False) never
-    # sees a shape change.
-    seg_lens = cu[1:] - cu[:-1]
-    max_seqlen = int(seg_lens.max().item())
+    # Pad to fixed length (trailing B*T = zero-length sequences to FA3).
     if cu.numel() < max_cu_len:
         pad = cu.new_full((max_cu_len - cu.numel(),), B * T)
         cu = torch.cat([cu, pad])
-    return cu.contiguous(), max_seqlen
+    return cu.contiguous()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
