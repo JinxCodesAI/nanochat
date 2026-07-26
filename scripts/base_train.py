@@ -346,7 +346,8 @@ first = next(train_loader)
 if args.varlen_doc_attn:
     x, y, doc_offsets, dataloader_state_dict = first
     cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, args.device_batch_size, args.max_seq_len)
-    print0(f"[varlen] First batch: B={args.device_batch_size} T={args.max_seq_len}, total_docs={cu_seqlens.numel() - 1}, max_seqlen={max_seqlen}")
+    real_docs = (cu_seqlens[:-1] != cu_seqlens[1:]).sum().item()  # count non-zero-length segments
+    print0(f"[varlen] First batch: B={args.device_batch_size} T={args.max_seq_len}, real_docs={real_docs}, max_seqlen={max_seqlen}")
     print0(f"[varlen] cu_seqlens[:10] = {cu_seqlens[:10].tolist()}, ...[-5:] = {cu_seqlens[-5:].tolist()}")
     print0(f"[varlen] doc_offsets row 0[:8] = {doc_offsets[0, :8].tolist()}")
 else:

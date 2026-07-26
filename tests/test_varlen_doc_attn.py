@@ -41,45 +41,66 @@ def test_flatten_doc_offsets_basic():
         [0, 4, 6, T_plus_1, T_plus_1],
     ], dtype=torch.int32)
     cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-    # Row 0: docs [3, 7], cap at 10 (trailing padding).
-    # Row 1: docs [4+10=14, 6+10=16], cap at 20 (trailing padding / final B*T).
-    # Dedup merges the row-1 cap (20) with final B*T (20).
-    # cu = [0, 3, 7, 10, 14, 16, 20]
-    expected = torch.tensor([0, 3, 7, 10, 14, 16, 20], dtype=torch.int32)
+    # max_docs_per_row = 4, so max_cu_len = 2*4+1 = 9.
+    # Real cu: [0, 3, 7, 10, 14, 16, 20], padded with 20 to length 9.
+    expected = torch.tensor([0, 3, 7, 10, 14, 16, 20, 20, 20], dtype=torch.int32)
+    assert cu.shape == (9,), f"cu_seqlens shape mismatch: {cu.shape}, expected (9,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
-    # doc lengths: [3, 4, 4, 4, 2] -> max = 4
+    # doc/cap lengths: [3, 4, 4, 4, 2, 0, 0, 0] -> max = 4
     assert max_seqlen == 4, f"max_seqlen mismatch: {max_seqlen} vs 4"
     print("test_flatten_doc_offsets_basic PASSED")
 
 
 def test_flatten_doc_offsets_single_doc():
-    """One row with a single doc that fills the entire row."""
+    """One row with no explicit docs (all padding). Cap segment covers all T tokens."""
     B, T = 1, 8
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([[0, T_plus_1, T_plus_1, T_plus_1]], dtype=torch.int32)
     cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-    # Row 0: 0 docs, cap at 8 + dedup with B*T=8.
-    # cu = [0, 8]
-    expected = torch.tensor([0, 8], dtype=torch.int32)
+    # max_docs_per_row = 3, so max_cu_len = 1*3+1 = 4.
+    # Real cu: [0, 8], padded with 8 to length 4.
+    expected = torch.tensor([0, 8, 8, 8], dtype=torch.int32)
+    assert cu.shape == (4,), f"cu_seqlens shape mismatch: {cu.shape}, expected (4,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
-    assert max_seqlen == 0
+    # Segments: [8, 0, 0] -> max_seqlen = T (cap covers all tokens)
+    assert max_seqlen == 8, f"max_seqlen mismatch: {max_seqlen} vs 8"
     print("test_flatten_doc_offsets_single_doc PASSED")
 
 
 def test_flatten_doc_offsets_padding_only():
     """All padding (shouldn't happen in practice but should be safe)."""
     B, T = 2, 5
-    # Note: would never actually happen because dataloader always sets column 0 = 0
-    # but we test the edge case anyway.
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([[0, T_plus_1, T_plus_1], [0, T_plus_1, T_plus_1]], dtype=torch.int32)
     cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-    # Row 0: 0 docs, cap at 5. Row 1: 0 docs, cap at 10 (= B*T).
-    # Dedup merges row-1 cap with final B*T.
-    # cu_seqlens = [0, 5, 10]
-    expected = torch.tensor([0, 5, 10], dtype=torch.int32)
+    # max_docs_per_row = 2, so max_cu_len = 2*2+1 = 5.
+    # Real cu: [0, 5, 10], padded with 10 to length 5.
+    expected = torch.tensor([0, 5, 10, 10, 10], dtype=torch.int32)
+    assert cu.shape == (5,), f"cu_seqlens shape mismatch: {cu.shape}, expected (5,)"
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
+    # Segments: [5, 5, 0, 0] -> max_seqlen = 5
+    assert max_seqlen == 5, f"max_seqlen mismatch: {max_seqlen} vs 5"
     print("test_flatten_doc_offsets_padding_only PASSED")
+
+
+def test_flatten_doc_offsets_crop_cap():
+    """Single row where a short doc leaves a trailing cap segment.
+    This is the case where last_doc_end < T, so a cap at (b+1)*T is injected.
+    The cap segment length must be included in max_seqlen."""
+    B, T = 1, 12
+    T_plus_1 = T + 1
+    # One doc of length 5, then all padding. Cap covers remaining 7 tokens.
+    doc_offsets = torch.tensor([[0, 5, T_plus_1, T_plus_1, T_plus_1]], dtype=torch.int32)
+    cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+    # max_docs_per_row = 4, max_cu_len = 1*4+1 = 5.
+    # Real entries: col 0 (=0), col 1 (=5). K=2, last_doc_end=5 < T=12 => cap at 12.
+    # cu = [0, 5, 12], padded to [0, 5, 12, 12, 12].
+    expected = torch.tensor([0, 5, 12, 12, 12], dtype=torch.int32)
+    assert cu.shape == (5,), f"cu_seqlens shape mismatch: {cu.shape}, expected (5,)"
+    assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
+    # Segments: doc=[5], cap=[7], padding=[0,0] -> max = 7
+    assert max_seqlen == 7, f"max_seqlen mismatch: {max_seqlen} vs 7"
+    print("test_flatten_doc_offsets_crop_cap PASSED")
 
 
 def test_dataloader_yields_doc_offsets():
@@ -193,6 +214,7 @@ if __name__ == "__main__":
     test_flatten_doc_offsets_basic()
     test_flatten_doc_offsets_single_doc()
     test_flatten_doc_offsets_padding_only()
+    test_flatten_doc_offsets_crop_cap()
     test_dataloader_yields_doc_offsets()
     test_dataloader_no_doc_offsets_backward_compat()
     test_model_forward_with_doc_offsets_falls_back()

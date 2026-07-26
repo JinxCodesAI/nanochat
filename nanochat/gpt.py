@@ -71,61 +71,48 @@ def apply_rotary_emb(x, cos, sin):
 
 def _flatten_doc_offsets(doc_offsets, B, T):
     """
-    Convert the per-row (B, max_docs+1) doc-boundary tensor into a single 1D
-    cu_seqlens tensor for FA3's varlen interface.
+    Convert the per-row (B, max_docs+1) doc-boundary tensor into a fixed-shape
+    1D cu_seqlens tensor for FA3's varlen interface.
+
+    The output is always padded to the maximum possible size
+    (B * max_docs_per_row + 1) so that torch.compile(dynamic=False) sees a
+    static tensor shape across batches.  Trailing entries past the real docs
+    are filled with B*T, which FA3 treats as zero-length sequences (no-ops).
 
     Dataloader layout: doc_offsets[b, 0] = 0 (start of doc 0), and
     doc_offsets[b, k] = end position of doc k-1 in row b (for k >= 1). Unused
-    trailing slots are filled with row_capacity = T+1, which varlen attention
-    treats as zero-length docs at the row boundary (no-ops).
-
-    cu_seqlens convention (FA3): entry k is the end position of doc k-1 in the
-    flat sequence. The flat sequence is built by row-major concatenation of
-    the per-row tokens (each row has T+1 tokens). So for row b with K real
-    entries, we emit:
-        cu_seqlens[prev_idx + 0] = 0 + prev_tok
-        cu_seqlens[prev_idx + 1] = doc_offsets[b, 1] + prev_tok
-        ...
-        cu_seqlens[prev_idx + K] = doc_offsets[b, K] + prev_tok
-    where prev_idx is the cumulative number of real entries in rows 0..b-1
-    and prev_tok is the cumulative number of tokens in rows 0..b-1.
+    trailing slots are filled with row_capacity = T+1.
 
     Returns:
-        cu_seqlens: 1D int32 tensor of length (total_real_docs + 1).
-        max_seqlen: int, the longest doc length in the batch.
+        cu_seqlens: 1D int32 tensor of fixed length (B*max_docs_per_row + 1).
+        max_seqlen: int, the longest doc or cap segment length in the batch.
     """
     assert doc_offsets.dim() == 2 and doc_offsets.size(0) == B, (
         f"doc_offsets must be (B, max_docs+1), got {tuple(doc_offsets.shape)}"
     )
+    max_docs_per_row = doc_offsets.size(1) - 1
+    max_cu_len = B * max_docs_per_row + 1  # fixed output length
+
     # `real` masks out the padding slots (those equal to row_capacity = T+1).
     offs = doc_offsets.to(torch.int64)
     real = offs < (T + 1)
     # Number of real entries per row K_b (includes column 0 = the row-start marker).
     row_real_count = real.sum(dim=1)  # (B,) int64
-    # Per-row token offset in the flat sequence. The model sees T tokens per row
-    # (inputs = row_buffer[:, :-1], targets = row_buffer[:, 1:]).
+    # Per-row token offset in the flat sequence.
     row_tok_offset = torch.arange(B, dtype=torch.int64, device=offs.device) * T
     # Build cu_seqlens: a single leading 0, then for each row b:
     #   offs[b, 1] + row_tok_offset[b]   (end of doc 0 in row b)
     #   offs[b, 2] + row_tok_offset[b]   (end of doc 1 in row b)
     #   ...
     #   (b+1)*T  if the last doc's end < T  (caps row's trailing crop padding)
-    # The final entry is always B*T. Padding caps are inserted to prevent a
-    # single monster segment from spanning across rows.
-    total_real = int(row_real_count.sum().item())  # sum of all K_b
-    # Estimate upper bound: total docs + up to B per-row caps + 2 (leading 0 + final B*T).
-    # Build per row first, then concatenate.
+    # The final entry is always B*T.
     parts = []
     for b in range(B):
         K = int(row_real_count[b].item())
-        # real entries at columns 0..K-1. Skip column 0 (row-start marker).
-        # Take columns 1..K-1 as doc-ends.
         row_ends = []
         if K > 1:
             for k in range(1, K):
                 row_ends.append(int(offs[b, k].item()) + int(row_tok_offset[b].item()))
-        # If the last doc doesn't reach the row boundary, cap with (b+1)*T
-        # so FA3 doesn't create a cross-row segment for the trailing padding.
         if K > 1:
             last_doc_end = int(offs[b, K - 1].item())
         else:
@@ -149,19 +136,9 @@ def _flatten_doc_offsets(doc_offsets, B, T):
         cu = cu_raw[keep]
     else:
         cu = cu_raw
-    # max_seqlen: longest single doc in the batch.
-    # Doc length = offs[b, k+1] - offs[b, k] for real entries b,k with k >= 1.
-    # Also include row-cap segments.
-    max_seqlen = 0
-    for b in range(B):
-        K = int(row_real_count[b].item())
-        if K >= 2:
-            for k in range(1, K):
-                d = int((offs[b, k] - offs[b, k - 1]).item())
-                if d > max_seqlen:
-                    max_seqlen = d
+
     # -----------------------------------------------------------------
-    # Sanity checks: catch bad cu_seqlens before FA3 sees them.
+    # Sanity checks
     # -----------------------------------------------------------------
     assert cu[0].item() == 0, f"cu_seqlens[0] must be 0, got {cu[0].item()}"
     if cu.numel() > 1:
@@ -170,6 +147,15 @@ def _flatten_doc_offsets(doc_offsets, B, T):
         assert (diffs > 0).all(), f"cu_seqlens must be strictly increasing, got non-positive diffs at indices: {(diffs <= 0).nonzero(as_tuple=True)[0][:5].tolist()}"
         assert cu[-1].item() == B * T, f"cu_seqlens must end at total tokens {B*T}, got {cu[-1].item()}"
         assert (cu[-1] >= cu[-2]).item(), f"Last entry must be >= second-last, got {cu[-2].item()} >= {cu[-1].item()}"
+
+    # Compute max_seqlen from ALL segments (including cap segments),
+    # then pad cu to fixed length so torch.compile(dynamic=False) never
+    # sees a shape change.
+    seg_lens = cu[1:] - cu[:-1]
+    max_seqlen = int(seg_lens.max().item())
+    if cu.numel() < max_cu_len:
+        pad = cu.new_full((max_cu_len - cu.numel(),), B * T)
+        cu = torch.cat([cu, pad])
     return cu.contiguous(), max_seqlen
 
 class CausalSelfAttention(nn.Module):
