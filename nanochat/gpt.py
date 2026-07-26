@@ -155,7 +155,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_offsets=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -179,13 +179,11 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None and doc_offsets is not None:
-            # Training, document-isolated: pack tokens into one flat sequence and
-            # use FA3's varlen interface so each token can only attend within its
-            # own document. Row-major flattening is fine: the kernel uses cu_seqlens
-            # to find doc boundaries, so position within the flat sequence carries
-            # no semantic meaning.
-            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+        if kv_cache is None and cu_seqlens is not None:
+            # Document-isolated training via varlen attention: the cu_seqlens
+            # tensor was built once in GPT.forward (outside torch.compile) from
+            # the doc_offsets buffer. Row-major flattening matches the dataloader
+            # layout.
             q_flat = q.reshape(-1, self.n_head, self.head_dim)
             k_flat = k.reshape(-1, self.n_kv_head, self.head_dim)
             v_flat = v.reshape(-1, self.n_kv_head, self.head_dim)
@@ -238,8 +236,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_offsets=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, doc_offsets=doc_offsets)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, cu_seqlens=None, max_seqlen=0):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         x = x + self.mlp(norm(x))
         return x
 
@@ -589,12 +587,17 @@ class GPT(nn.Module):
         x_backout = None
         # Honour the config flag: doc_offsets can be passed but we ignore it for
         # the varlen path if the model was constructed with use_varlen_doc_attn=False.
-        if doc_offsets is not None and not self.config.use_varlen_doc_attn:
-            doc_offsets = None
+        # Pre-compute cu_seqlens once here (outside the trunk loop) so the
+        # conversion from (B, max_docs+1) to 1D int32 runs outside torch.compile.
+        if doc_offsets is not None and self.config.use_varlen_doc_attn:
+            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+        else:
+            cu_seqlens = None
+            max_seqlen = 0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, doc_offsets=doc_offsets)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
