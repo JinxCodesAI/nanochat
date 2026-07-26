@@ -109,30 +109,57 @@ def _flatten_doc_offsets(doc_offsets, B, T):
     #   offs[b, 1] + row_tok_offset[b]   (end of doc 0 in row b)
     #   offs[b, 2] + row_tok_offset[b]   (end of doc 1 in row b)
     #   ...
-    # Columns 0 are always 0 and act as row-start markers — we skip them except
-    # for the batch-level leading zero that FA3 requires.
-    # The final entry is always B*T to cover any trailing padding and ensure
-    # the varlen output has the same shape as the model's (B*T) tokens.
+    #   (b+1)*T  if the last doc's end < T  (caps row's trailing crop padding)
+    # The final entry is always B*T. Padding caps are inserted to prevent a
+    # single monster segment from spanning across rows.
     total_real = int(row_real_count.sum().item())  # sum of all K_b
-    total_docs = total_real - B  # each row contributes K_b - 1 docs
-    cu = torch.zeros(total_docs + 2, dtype=torch.int32, device=offs.device)
-    if total_docs > 0:
-        parts = []
-        for b in range(B):
-            K = int(row_real_count[b].item())
-            if K > 1:
-                doc_ends = offs[b, 1:K] + row_tok_offset[b]
-                parts.append(doc_ends)
-        cu[1:total_docs + 1] = torch.cat(parts).to(torch.int32)
-    cu[-1] = B * T  # always cap at the batch-total token count
+    # Estimate upper bound: total docs + up to B per-row caps + 2 (leading 0 + final B*T).
+    # Build per row first, then concatenate.
+    parts = []
+    for b in range(B):
+        K = int(row_real_count[b].item())
+        # real entries at columns 0..K-1. Skip column 0 (row-start marker).
+        # Take columns 1..K-1 as doc-ends.
+        row_ends = []
+        if K > 1:
+            for k in range(1, K):
+                row_ends.append(int(offs[b, k].item()) + int(row_tok_offset[b].item()))
+        # If the last doc doesn't reach the row boundary, cap with (b+1)*T
+        # so FA3 doesn't create a cross-row segment for the trailing padding.
+        if K > 1:
+            last_doc_end = int(offs[b, K - 1].item())
+        else:
+            last_doc_end = 0
+        if last_doc_end < T:
+            row_ends.append((b + 1) * T)
+        if row_ends:
+            parts.append(torch.tensor(row_ends, dtype=torch.int32, device=offs.device))
+    # Assemble: [0, ...all doc-ends..., B*T]
+    if parts:
+        body = torch.cat(parts)
+    else:
+        body = torch.empty(0, dtype=torch.int32, device=offs.device)
+    cu_raw = torch.cat([torch.zeros(1, dtype=torch.int32, device=offs.device), body,
+                         torch.tensor([B * T], dtype=torch.int32, device=offs.device)])
+    # Remove consecutive duplicates that can arise when a row's last doc ends
+    # exactly at T and a per-row cap or the final B*T cap produces the same value.
+    if cu_raw.numel() >= 2:
+        keep = torch.ones(cu_raw.numel(), dtype=torch.bool, device=offs.device)
+        keep[1:] = (cu_raw[1:] != cu_raw[:-1])
+        cu = cu_raw[keep]
+    else:
+        cu = cu_raw
     # max_seqlen: longest single doc in the batch.
     # Doc length = offs[b, k+1] - offs[b, k] for real entries b,k with k >= 1.
-    if total_docs > 0:
-        diffs = offs[:, 1:] - offs[:, :-1]
-        real_diffs = torch.where(real[:, 1:], diffs, torch.zeros_like(diffs))
-        max_seqlen = int(real_diffs.max().item())
-    else:
-        max_seqlen = 0
+    # Also include row-cap segments.
+    max_seqlen = 0
+    for b in range(B):
+        K = int(row_real_count[b].item())
+        if K >= 2:
+            for k in range(1, K):
+                d = int((offs[b, k] - offs[b, k - 1]).item())
+                if d > max_seqlen:
+                    max_seqlen = d
     # -----------------------------------------------------------------
     # Sanity checks: catch bad cu_seqlens before FA3 sees them.
     # -----------------------------------------------------------------
@@ -142,6 +169,7 @@ def _flatten_doc_offsets(doc_offsets, B, T):
         diffs = cu[1:] - cu[:-1]
         assert (diffs > 0).all(), f"cu_seqlens must be strictly increasing, got non-positive diffs at indices: {(diffs <= 0).nonzero(as_tuple=True)[0][:5].tolist()}"
         assert cu[-1].item() == B * T, f"cu_seqlens must end at total tokens {B*T}, got {cu[-1].item()}"
+        assert (cu[-1] >= cu[-2]).item(), f"Last entry must be >= second-last, got {cu[-2].item()} >= {cu[-1].item()}"
     return cu.contiguous(), max_seqlen
 
 class CausalSelfAttention(nn.Module):
