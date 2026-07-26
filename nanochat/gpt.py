@@ -98,44 +98,50 @@ def _flatten_doc_offsets(doc_offsets, B, T):
         f"doc_offsets must be (B, max_docs+1), got {tuple(doc_offsets.shape)}"
     )
     # `real` masks out the padding slots (those equal to row_capacity = T+1).
-    # The first column is always 0 and is always real; we keep it to mark the
-    # start of doc 0.
     offs = doc_offsets.to(torch.int64)
     real = offs < (T + 1)
-    # Per-row count of real entries K_b.
+    # Number of real entries per row K_b (includes column 0 = the row-start marker).
     row_real_count = real.sum(dim=1)  # (B,) int64
-    # Two cumulative offsets per row:
-    #   row_offset_idx: cumulative number of cu_seqlens entries in rows 0..b-1
-    #     (used to place values into the flat cu_seqlens array).
-    #   row_offset_tok: cumulative number of tokens in rows 0..b-1 (used to
-    #     shift per-row offsets into absolute flat-sequence positions).
-    row_offset_idx = torch.cat([torch.zeros(1, dtype=torch.int64, device=offs.device),
-                                row_real_count[:-1].cumsum(0)])
-    row_offset_tok = torch.arange(B, dtype=torch.int64, device=offs.device) * (T + 1)
-    # Local position within row: 0, 1, ..., K_b-1 for real entries, else -1
-    local_pos = torch.where(real, real.cumsum(dim=1) - 1, torch.full_like(offs, -1))
-    flat_idx_2d = torch.where(real, row_offset_idx.unsqueeze(1) + local_pos, torch.full_like(offs, -1))
-    # Absolute values: per-row offset + cumulative tokens of previous rows.
-    abs_offs = (offs + row_offset_tok.unsqueeze(1)) * real.to(torch.int64)
-    # Build the flat cu_seqlens tensor.
-    total_real = int(row_real_count.sum().item())
-    cu = torch.zeros(total_real, dtype=torch.int32, device=offs.device)
-    if total_real > 0:
-        flat_idx_real = flat_idx_2d.reshape(-1)[real.reshape(-1)].to(torch.int32)
-        abs_offs_real = abs_offs.reshape(-1)[real.reshape(-1)].to(torch.int32)
-        cu.scatter_(0, flat_idx_real, abs_offs_real)
-    # max_seqlen: longest doc length in the batch. Doc length = end - start
-    # where start = doc_offsets[b, k-1] and end = doc_offsets[b, k]. Take the
-    # max per-row diff within the real entries, then max across rows.
-    if total_real > 1:
-        # Per-row diff between consecutive real entries.
-        # We approximate: shift the real_offs by -1 within each row (zero-pad
-        # the unsed slots), then diff.
+    # Per-row token offset in the flat sequence. The model sees T tokens per row
+    # (inputs = row_buffer[:, :-1], targets = row_buffer[:, 1:]).
+    row_tok_offset = torch.arange(B, dtype=torch.int64, device=offs.device) * T
+    # Build cu_seqlens: a single leading 0, then for each row b:
+    #   offs[b, 1] + row_tok_offset[b]   (end of doc 0 in row b)
+    #   offs[b, 2] + row_tok_offset[b]   (end of doc 1 in row b)
+    #   ...
+    # Columns 0 are always 0 and act as row-start markers — we skip them except
+    # for the batch-level leading zero that FA3 requires.
+    # The final entry is always B*T to cover any trailing padding and ensure
+    # the varlen output has the same shape as the model's (B*T) tokens.
+    total_real = int(row_real_count.sum().item())  # sum of all K_b
+    total_docs = total_real - B  # each row contributes K_b - 1 docs
+    cu = torch.zeros(total_docs + 2, dtype=torch.int32, device=offs.device)
+    if total_docs > 0:
+        parts = []
+        for b in range(B):
+            K = int(row_real_count[b].item())
+            if K > 1:
+                doc_ends = offs[b, 1:K] + row_tok_offset[b]
+                parts.append(doc_ends)
+        cu[1:total_docs + 1] = torch.cat(parts).to(torch.int32)
+    cu[-1] = B * T  # always cap at the batch-total token count
+    # max_seqlen: longest single doc in the batch.
+    # Doc length = offs[b, k+1] - offs[b, k] for real entries b,k with k >= 1.
+    if total_docs > 0:
         diffs = offs[:, 1:] - offs[:, :-1]
-        diffs = torch.where(real[:, 1:], diffs, torch.zeros_like(diffs))
-        max_seqlen = int(diffs.max().item())
+        real_diffs = torch.where(real[:, 1:], diffs, torch.zeros_like(diffs))
+        max_seqlen = int(real_diffs.max().item())
     else:
         max_seqlen = 0
+    # -----------------------------------------------------------------
+    # Sanity checks: catch bad cu_seqlens before FA3 sees them.
+    # -----------------------------------------------------------------
+    assert cu[0].item() == 0, f"cu_seqlens[0] must be 0, got {cu[0].item()}"
+    if cu.numel() > 1:
+        assert (cu[1:] >= 1).all(), f"All doc-ends must be >= 1, got first zeros at: {(cu[1:] == 0).nonzero(as_tuple=True)[0][:5].tolist()}"
+        diffs = cu[1:] - cu[:-1]
+        assert (diffs > 0).all(), f"cu_seqlens must be strictly increasing, got non-positive diffs at indices: {(diffs <= 0).nonzero(as_tuple=True)[0][:5].tolist()}"
+        assert cu[-1].item() == B * T, f"cu_seqlens must end at total tokens {B*T}, got {cu[-1].item()}"
     return cu.contiguous(), max_seqlen
 
 class CausalSelfAttention(nn.Module):

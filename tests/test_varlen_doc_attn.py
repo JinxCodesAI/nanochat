@@ -41,9 +41,11 @@ def test_flatten_doc_offsets_basic():
         [0, 4, 6, T_plus_1, T_plus_1],
     ], dtype=torch.int32)
     cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-    # Row 0: docs end at flat positions 0, 3, 7.
-    # Row 1: row starts at T+1=11 tokens in; docs end at 11, 11+4=15, 11+6=17.
-    expected = torch.tensor([0, 3, 7, 11, 15, 17], dtype=torch.int32)
+    # Row 0: 2 docs ending at pos 3 and 7 (within row). Flat: 3, 7.
+    # Row 1: 2 docs ending at pos 4 and 6 (within row). Flat: T+4=14, T+6=16.
+    # Final cap: B*T = 20.
+    # cu_seqlens = [0, 3, 7, 14, 16, 20]
+    expected = torch.tensor([0, 3, 7, 14, 16, 20], dtype=torch.int32)
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
     # doc lengths: [3, 4, 4, 4, 2] -> max = 4
     assert max_seqlen == 4, f"max_seqlen mismatch: {max_seqlen} vs 4"
@@ -56,8 +58,8 @@ def test_flatten_doc_offsets_single_doc():
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([[0, T_plus_1, T_plus_1, T_plus_1]], dtype=torch.int32)
     cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-    # only one real entry: column 0 = 0. So cu = [0].
-    expected = torch.tensor([0], dtype=torch.int32)
+    # 1 real entry (col 0=0), 0 docs. cu = [0, B*T=8].
+    expected = torch.tensor([0, 8], dtype=torch.int32)
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
     assert max_seqlen == 0
     print("test_flatten_doc_offsets_single_doc PASSED")
@@ -71,9 +73,9 @@ def test_flatten_doc_offsets_padding_only():
     T_plus_1 = T + 1
     doc_offsets = torch.tensor([[0, T_plus_1, T_plus_1], [0, T_plus_1, T_plus_1]], dtype=torch.int32)
     cu, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
-    # Each row has 1 real entry (col 0 = 0). Row 1 starts at T+1=6 tokens in.
-    # So row 0 contributes [0], row 1 contributes [6]. cu = [0, 6].
-    expected = torch.tensor([0, 6], dtype=torch.int32)
+    # Each row has 1 real entry (col 0=0, row-start marker). 0 docs.
+    # cu_seqlens = [0, B*T=10] (leading zero + batch-cap).
+    expected = torch.tensor([0, 10], dtype=torch.int32)
     assert torch.equal(cu, expected), f"cu_seqlens mismatch: {cu} vs {expected}"
     print("test_flatten_doc_offsets_padding_only PASSED")
 
