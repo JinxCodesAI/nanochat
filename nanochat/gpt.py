@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Document isolation: when True, training uses flash_attn_varlen_func with
+    # document boundaries from the dataloader. When False, falls back to plain
+    # causal attention with the crop-and-discard packing policy.
+    use_varlen_doc_attn: bool = True
 
 
 def norm(x):
@@ -64,6 +68,76 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+
+def _flatten_doc_offsets(doc_offsets, B, T):
+    """
+    Convert the per-row (B, max_docs+1) doc-boundary tensor into a single 1D
+    cu_seqlens tensor for FA3's varlen interface.
+
+    Dataloader layout: doc_offsets[b, 0] = 0 (start of doc 0), and
+    doc_offsets[b, k] = end position of doc k-1 in row b (for k >= 1). Unused
+    trailing slots are filled with row_capacity = T+1, which varlen attention
+    treats as zero-length docs at the row boundary (no-ops).
+
+    cu_seqlens convention (FA3): entry k is the end position of doc k-1 in the
+    flat sequence. The flat sequence is built by row-major concatenation of
+    the per-row tokens (each row has T+1 tokens). So for row b with K real
+    entries, we emit:
+        cu_seqlens[prev_idx + 0] = 0 + prev_tok
+        cu_seqlens[prev_idx + 1] = doc_offsets[b, 1] + prev_tok
+        ...
+        cu_seqlens[prev_idx + K] = doc_offsets[b, K] + prev_tok
+    where prev_idx is the cumulative number of real entries in rows 0..b-1
+    and prev_tok is the cumulative number of tokens in rows 0..b-1.
+
+    Returns:
+        cu_seqlens: 1D int32 tensor of length (total_real_docs + 1).
+        max_seqlen: int, the longest doc length in the batch.
+    """
+    assert doc_offsets.dim() == 2 and doc_offsets.size(0) == B, (
+        f"doc_offsets must be (B, max_docs+1), got {tuple(doc_offsets.shape)}"
+    )
+    # `real` masks out the padding slots (those equal to row_capacity = T+1).
+    # The first column is always 0 and is always real; we keep it to mark the
+    # start of doc 0.
+    offs = doc_offsets.to(torch.int64)
+    real = offs < (T + 1)
+    # Per-row count of real entries K_b.
+    row_real_count = real.sum(dim=1)  # (B,) int64
+    # Two cumulative offsets per row:
+    #   row_offset_idx: cumulative number of cu_seqlens entries in rows 0..b-1
+    #     (used to place values into the flat cu_seqlens array).
+    #   row_offset_tok: cumulative number of tokens in rows 0..b-1 (used to
+    #     shift per-row offsets into absolute flat-sequence positions).
+    row_offset_idx = torch.cat([torch.zeros(1, dtype=torch.int64, device=offs.device),
+                                row_real_count[:-1].cumsum(0)])
+    row_offset_tok = torch.arange(B, dtype=torch.int64, device=offs.device) * (T + 1)
+    # Local position within row: 0, 1, ..., K_b-1 for real entries, else -1
+    local_pos = torch.where(real, real.cumsum(dim=1) - 1, torch.full_like(offs, -1))
+    flat_idx_2d = torch.where(real, row_offset_idx.unsqueeze(1) + local_pos, torch.full_like(offs, -1))
+    # Absolute values: per-row offset + cumulative tokens of previous rows.
+    abs_offs = (offs + row_offset_tok.unsqueeze(1)) * real.to(torch.int64)
+    # Build the flat cu_seqlens tensor.
+    total_real = int(row_real_count.sum().item())
+    cu = torch.zeros(total_real, dtype=torch.int32, device=offs.device)
+    if total_real > 0:
+        flat_idx_real = flat_idx_2d.reshape(-1)[real.reshape(-1)].to(torch.int32)
+        abs_offs_real = abs_offs.reshape(-1)[real.reshape(-1)].to(torch.int32)
+        cu.scatter_(0, flat_idx_real, abs_offs_real)
+    # max_seqlen: longest doc length in the batch. Doc length = end - start
+    # where start = doc_offsets[b, k-1] and end = doc_offsets[b, k]. Take the
+    # max per-row diff within the real entries, then max across rows.
+    if total_real > 1:
+        # Per-row diff between consecutive real entries.
+        # We approximate: shift the real_offs by -1 within each row (zero-pad
+        # the unsed slots), then diff.
+        diffs = offs[:, 1:] - offs[:, :-1]
+        diffs = torch.where(real[:, 1:], diffs, torch.zeros_like(diffs))
+        max_seqlen = int(diffs.max().item())
+    else:
+        max_seqlen = 0
+    return cu.contiguous(), max_seqlen
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -81,7 +155,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_offsets=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -105,7 +179,24 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
+        if kv_cache is None and doc_offsets is not None:
+            # Training, document-isolated: pack tokens into one flat sequence and
+            # use FA3's varlen interface so each token can only attend within its
+            # own document. Row-major flattening is fine: the kernel uses cu_seqlens
+            # to find doc boundaries, so position within the flat sequence carries
+            # no semantic meaning.
+            cu_seqlens, max_seqlen = _flatten_doc_offsets(doc_offsets, B, T)
+            q_flat = q.reshape(-1, self.n_head, self.head_dim)
+            k_flat = k.reshape(-1, self.n_kv_head, self.head_dim)
+            v_flat = v.reshape(-1, self.n_kv_head, self.head_dim)
+            y_flat = flash_attn.flash_attn_varlen_func(
+                q_flat, k_flat, v_flat,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                causal=True, window_size=window_size,
+            )
+            y = y_flat.reshape(B, T, self.n_head, self.head_dim)
+        elif kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
@@ -147,8 +238,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, doc_offsets=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, doc_offsets=doc_offsets)
         x = x + self.mlp(norm(x))
         return x
 
@@ -456,7 +547,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', doc_offsets=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -496,10 +587,14 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Honour the config flag: doc_offsets can be passed but we ignore it for
+        # the varlen path if the model was constructed with use_varlen_doc_attn=False.
+        if doc_offsets is not None and not self.config.use_varlen_doc_attn:
+            doc_offsets = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, doc_offsets=doc_offsets)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
